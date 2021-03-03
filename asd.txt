@@ -1,0 +1,1814 @@
+//@ts-check
+const LanguageService = require("../services/language.service");
+const Op = require("sequelize").Op;
+const models = require("../../models");
+const _ = require("lodash");
+const util = require("../helpers/utils");
+const s3Helper = require("../helpers/s3.helper");
+const pdfHelper = require("../helpers/pdf.helper");
+const SlugHelper = require("../helpers/slug.helper");
+const countryHelper = require("../helpers/country.helper");
+const Sequelize = require("sequelize");
+const httpContext = require("express-http-context");
+const utils = require("../helpers/utils.js");
+const moment = require("moment");
+const QRCodeService = require("../services/qrcode.service");
+const QRUsersService = require("../services/qrUsers.service");
+
+/**
+ * Filter to return classification on caller's input data.
+ * @param   {object}       params     Caller's input data.
+ * @returns {object}         Object to filter according to the input data.
+ */
+
+const _getClassificationFilter = (params) => {
+  let classificationFilter = {};
+
+  const categoryFilter = params.params.category.value
+    ? {
+        [`row_data.category`]: params.params.category.value,
+      }
+    : {};
+
+  const genderFilter = params.params.gender.value
+    ? {
+        [`row_data.gender`]: params.params.gender.value,
+      }
+    : {};
+
+  const clubFilter = params.params.club.value
+    ? {
+        [`row_data.club`]: params.params.club.value,
+      }
+    : {};
+
+  const searchFilter = params.params.search.value
+    ? {
+        [Op.or]: [
+          Sequelize.where(Sequelize.cast(Sequelize.col("row_data"), "text"), {
+            [Op.iLike]: `%${params.params.search.value}%`,
+          }),
+        ],
+      }
+    : {};
+
+  classificationFilter = {
+    ...categoryFilter,
+    ...genderFilter,
+    ...clubFilter,
+    ...searchFilter,
+  };
+
+  return classificationFilter;
+};
+
+/**
+ * Return lists to populate filter combos at classification screen
+ * @param {*} modalityId
+ */
+const _getListsFromClassification = async (modalityId) => {
+  const classification = await models.ModalityClassification.findAll({
+    raw: true,
+    where: { modality_id: modalityId },
+  });
+
+  let categories = [];
+  let genders = [];
+  let clubs = [];
+
+  //populate arrays
+  classification.map((clas) => {
+    categories.push(clas.category);
+    genders.push(clas.gender);
+    clubs.push(clas.club);
+  });
+
+  //remove duplicates
+  categories = categories.filter(util.onlyUnique);
+  genders = genders.filter(util.onlyUnique);
+  clubs = clubs.filter(util.onlyUnique);
+
+  return {
+    categories: categories.sort(),
+    genders: genders.sort(),
+    clubs: clubs.sort(),
+  };
+};
+
+/**
+ * Return record from classification for current logged user (if any)
+ * @param {*} idLoggedUser
+ * @param {*} modalityId
+ */
+const _getLoggedUserClassification = async (idLoggedUser, modalityId) => {
+  idLoggedUser = httpContext.get("reqUserId");
+
+  if (idLoggedUser) {
+    const client = await models.Client.findOne({
+      raw: true,
+      where: { user_id: idLoggedUser },
+    });
+    if (!client) {
+      return null;
+    }
+
+    return await models.ModalityClassification.findOne({
+      raw: true,
+      where: {
+        client_id: client.id,
+        modality_id: modalityId,
+      },
+    });
+  } else {
+    return null;
+  }
+};
+/**
+ * Returns clubs classifications (average time)
+ * @param {*} modalityId
+ */
+const _getClubsClassification = async (modalityId, clubs) => {
+  //remove from clubs lists
+  const clubsToAvoid = ["INDEPENDIENTE"];
+  let allowedClubs = clubs;
+  clubsToAvoid.forEach((c) => {
+    const index = allowedClubs.indexOf(c);
+    if (index > -1) {
+      allowedClubs.splice(index, 1);
+    }
+  });
+
+  //averaged times grouped by club when there's more than 1 athlete per club
+  const clubsClassification = await models.ModalityClassification.findAll({
+    raw: true,
+    attributes: [
+      Sequelize.fn("count", Sequelize.col("id")),
+      "club",
+      Sequelize.fn("AVG", Sequelize.col("finish_time")),
+      Sequelize.fn("MIN", Sequelize.col("finish_time")),
+    ],
+    where: {
+      modality_id: modalityId,
+      club: allowedClubs,
+      finish_time: { [Op.gt]: 0 },
+    },
+    order: [[Sequelize.fn("AVG", Sequelize.col("finish_time")), "ASC"]],
+    group: ["club"],
+    having: Sequelize.where(Sequelize.literal("count(id)"), { [Op.gt]: 1 }),
+  });
+
+  return clubsClassification;
+};
+
+/**
+ * Returns availability for new inscriptions from web
+ * @param {*} modalityId
+ */
+const _checkAvailability = async (modalityId) => {
+  const modality = await models.ModalitiesView.findOne({
+    where: {
+      id: modalityId,
+    },
+  });
+  const config = await getInscriptionConfig(modalityId);
+  if (!config) {
+    return false;
+  }
+  const { allowInscriptions, startDate, endDate } = config;
+
+  if (!allowInscriptions) {
+    return false;
+  }
+  const dateIsBetween = utils.dateIsBetween(
+    startDate,
+    endDate,
+    new Date().toString(),
+  );
+
+  const { maxInscriptions, totalInscriptions } = modality;
+
+  if (maxInscriptions == null) {
+    return {
+      isAvaliable: dateIsBetween && true,
+      maxInscriptions,
+      totalInscriptions,
+    };
+  } else {
+    return dateIsBetween && maxInscriptions > totalInscriptions;
+  }
+};
+
+const getByRaceId = async (raceId) => {
+  const userId = httpContext.get("reqUserId");
+  const userRole = httpContext.get("reqUserRole");
+
+  if (userRole === "QR_READER") {
+    const racesId = await QRUsersService.getQRUserRacesId(userId);
+
+    if (!racesId.includes(raceId)) {
+      // The planner cannot get details from this race
+      throw {
+        code: 404,
+        message: "The event could not be found",
+        description:
+          "The event does not exist, is finished or you don't have enough permissions",
+      };
+    }
+
+    return await models.Modality.findAll({
+      attributes: ["name", "id"],
+      raw: true,
+      where: { race_id: raceId, is_published: true },
+      include: [
+        {
+          attributes: [],
+          model: models.Races,
+          as: "race",
+          where: {
+            is_published: true,
+            finish_date: { [Op.gte]: new Date() },
+          },
+        },
+      ],
+    });
+  }
+
+  try {
+    let modalitiesList = [];
+    const modalities = await models.Modality.findAll({
+      raw: true,
+      where: { race_id: raceId },
+    });
+
+    await Promise.all(
+      modalities.map(async (modality) => {
+        const c = await models.InscriptionsView.count({
+          where: {
+            modalityId: modality.id,
+            athleteStatus: {
+              [Op.or]: [{ [Op.not]: "CANCELLED" }, { [Op.is]: null }],
+            },
+          },
+        });
+
+        const maxInscriptions = await models.modalityInscriptionConfig
+          .findAll({
+            where: {
+              modalityId: modality.id,
+            },
+          })
+          .then((modalityConfig) => {
+            return modalityConfig.map((modality) => {
+              return modality.maxInscriptions;
+            });
+          });
+
+        const available = await _checkAvailability(modality.id);
+        const hasClassifications = await _hasClassifications(modality.id);
+        modality = {
+          ...modality,
+          inscriptionsCount: c,
+          available,
+          hasClassifications,
+          maxInscriptions: maxInscriptions[0],
+        };
+        modalitiesList.push(modality);
+      }),
+    );
+    return _.orderBy(modalitiesList, ["name"], ["asc"]);
+  } catch (e) {
+    console.log(e);
+    const error = {
+      code: 500,
+      message: LanguageService.getMessage("GET_MODALITIES_FAILURE"),
+      description: e,
+    };
+    throw error;
+  }
+};
+
+const create = async (params) => {
+  // const slug = SlugHelper.string_to_slug(params.name);
+  const race = await models.Races.findByPk(params.race_id);
+  const slug = await SlugHelper.getSlug(params.name, "modalities", race.slug);
+  return models.Modality.findOrCreate({
+    where: { name: params.name, race_id: params.race_id },
+    defaults: { ...params, slug },
+  })
+    .then(async ([m, n]) => {
+      const params = { modalityId: m.id };
+      await updateOrCreateInscriptionConfig(params);
+      return [m, n];
+    })
+    .catch((e) => {
+      !util.isTestRunning && console.log(e);
+      const error = {
+        code: 500,
+        message: LanguageService.getMessage("ADD_MODALITY_FAILURE"),
+        description: e,
+      };
+      throw error;
+    });
+};
+
+const _createInscriptionConfig = async (params) => {
+  const { modalityId } = params;
+  return models.modalityInscriptionConfig
+    .findOrCreate({
+      where: { modalityId },
+      defaults: { ...params },
+    })
+    .catch((e) => {
+      const error = {
+        code: 500,
+        message: LanguageService.getMessage(
+          "ADD_MODALITY_INSCRIPTION_CONFIG_FAILURE",
+        ),
+        description: e,
+      };
+      throw error;
+    });
+};
+
+const _updateInscriptionConfig = async (params) => {
+  const {
+    modalityId,
+    maxInscriptions,
+    limitWebInscriptions,
+    startDate,
+    endDate,
+    timeStart,
+    timeEnd,
+  } = params;
+
+  const start =
+    startDate && timeStart
+      ? util.getDateAndTime(startDate, timeStart)
+      : undefined;
+  const end =
+    endDate && timeEnd ? util.getDateAndTime(endDate, timeEnd) : undefined;
+
+  params.limitWebInscriptions = maxInscriptions
+    ? params.limitWebInscriptions
+    : null;
+  if (start) {
+    params = { ...params, startDate: start };
+  }
+  if (end) {
+    params = { ...params, endDate: end };
+  }
+
+  if (await areMaxInscriptionsValid(modalityId, maxInscriptions)) {
+    return models.modalityInscriptionConfig
+      .update(params, {
+        where: { modalityId },
+      })
+      .then((c) => {
+        return getInscriptionConfig(modalityId);
+      })
+      .catch((e) => {
+        const error = {
+          code: 500,
+          message: LanguageService.getMessage(
+            "UPDATE_MODALITY_INSCRIPTION_CONFIG_FAILURE",
+          ),
+          description: e,
+        };
+        throw error;
+      });
+  } else {
+    throw {
+      code: 500,
+      message: "MODALITY_MAX_INSCRIPTIONS",
+      description: "erro",
+    };
+  }
+};
+
+const areMaxInscriptionsValid = async (id, maxInscriptions) => {
+  const raceId = await getById(id).then((modality) => {
+    return modality.race_id;
+  });
+
+  const raceMaxInscriptions = await models.Races.findByPk(raceId).then(
+    (race) => {
+      return race.max_inscriptions;
+    },
+  );
+
+  const modalitiesMaxInscriptions = await getByRaceId(raceId).then(
+    async (modalities) => {
+      return Promise.all(
+        modalities.map(async (modality) => {
+          return await models.modalityInscriptionConfig
+            .findAll({
+              where: {
+                modalityId: modality.id,
+              },
+            })
+            .then((modalityConfig) => {
+              if (modalityConfig[0].modalityId !== id) {
+                return modalityConfig[0].maxInscriptions;
+              } else {
+                return maxInscriptions;
+              }
+            });
+        }),
+      ).then((_maxInscriptions) => {
+        if (!_maxInscriptions[0]) {
+          return Number.NaN;
+        }
+
+        return _maxInscriptions.reduce((acc, current) => {
+          acc = acc + current;
+          return acc;
+        }, 0);
+      });
+    },
+  );
+
+  let isValid = false;
+  if (Number.isNaN(modalitiesMaxInscriptions)) isValid = true;
+  else
+    isValid = raceMaxInscriptions
+      ? modalitiesMaxInscriptions <= raceMaxInscriptions
+      : true;
+
+  return isValid;
+};
+
+const getById = async (id) => {
+  return await models.Modality.findByPk(id, {
+    raw: true,
+  })
+    .then((modality) => {
+      if (modality === null) {
+        throw new Error();
+      }
+      return modality;
+    })
+    .then(async (modality) => {
+      const defaultPrice = await getInscriptionConfig(modality.id).then(
+        (modalityConfig) => {
+          return modalityConfig.priceDefault;
+        },
+      );
+      modality.default_price = defaultPrice;
+      return modality;
+    })
+    .catch((e) => {
+      const error = {
+        code: 404,
+        message: LanguageService.getMessage("GET_MODALITY_FAILURE"),
+        description: e,
+      };
+      throw error;
+    });
+};
+
+const update = async (id, params) => {
+  await models.Modality.update({ ...params }, { where: { id } });
+  return getById(id);
+};
+
+const updateOrCreateInscriptionConfig = async (params) => {
+  const { modalityId } = params;
+  const actualInscription = await getInscriptionConfig(modalityId);
+
+  if (actualInscription) {
+    return await _updateInscriptionConfig(params);
+  } else {
+    return await _createInscriptionConfig(params);
+  }
+};
+
+const getInscriptionConfig = async (modalityId) => {
+  return models.modalityInscriptionConfig
+    .findOne({ where: { modalityId } })
+    .catch((e) => {
+      const error = {
+        code: 500,
+        message: LanguageService.getMessage(
+          "GET_MODALITY_INSCRIPTION_CONFIG_FAILURE",
+        ),
+        description: e,
+      };
+      throw error;
+    });
+};
+
+const deleteById = async (id) => {
+  const inscriptions = await models.Inscription.findAll({
+    where: { modality_id: id },
+  });
+  if (inscriptions.length > 0) {
+    throw {
+      code: 200,
+      message: "inscriptionsNotNull",
+      description: "Hay inscripciones",
+    };
+  }
+
+  models.Modality.destroy({ where: { id } }).catch((e) => {
+    const error = {
+      code: 500,
+      message: LanguageService.getMessage("DELETE_MODALITY_FAILURE"),
+      description: e,
+    };
+    throw error;
+  });
+};
+
+const getModalityBySlug = async (slug) => {
+  const appConfigAll = await models.AppConfig.findAll({ raw: true });
+  const appConfig = appConfigAll[0];
+  const lockTime = appConfig.blockTime;
+  const today = new Date();
+  const todayString = today.toISOString();
+
+  return await models.Modality.findOne({
+    where: {
+      slug,
+    },
+    attributes: {
+      exclude: [
+        "created_by",
+        "automatic_dorsal_assignation",
+        "first_dorsal_to_assign",
+        "race_type",
+      ],
+    },
+    include: [
+      {
+        model: models.Races,
+        as: "race",
+        // attributes: {
+        //   exclude: ["id"]
+        // }
+      },
+      {
+        model: models.ModalityTeamType,
+        required: false,
+        attributes: {
+          exclude: ["modalityId", "modality_id"],
+        },
+      },
+      {
+        model: models.Price,
+        required: false,
+        attributes: {
+          exclude: ["modalityId", "modality_id"],
+        },
+        where: {
+          [Op.or]: [
+            {
+              [Op.and]: [
+                { dateStart: { [Op.lte]: todayString } },
+                { dateFinish: { [Op.gte]: todayString } },
+              ],
+            },
+            {
+              [Op.and]: [
+                { dateStart: { [Op.lte]: todayString } },
+                { dateFinish: { [Op.is]: null } },
+              ],
+            },
+          ],
+        },
+      },
+      {
+        model: models.modalityInscriptionConfig,
+        attributes: {
+          exclude: ["id", "modalityId", "modality_id"],
+        },
+      },
+      {
+        model: models.ModalityAttribute,
+        required: false,
+        separate: true,
+        as: "attributes",
+        where: {
+          visible: true,
+        },
+        order: [["id", "ASC"]],
+        include: [
+          {
+            model: models.ModalityAttrOptionsUsed,
+            attributes: {
+              exclude: ["visible"],
+            },
+            required: false,
+            separate: true,
+            order: [["id", "ASC"]],
+            where: Sequelize.literal(
+              `("ModalityAttrOptionsUsed"."limit" > "ModalityAttrOptionsUsed"."used" OR "ModalityAttrOptionsUsed"."limit" IS NULL)`,
+            ),
+          },
+        ],
+        attributes: {
+          exclude: ["modalityId", "modality_id"],
+        },
+      },
+    ],
+  })
+    .then(async (event) => {
+      if (event === null) {
+        throw new Error();
+      }
+
+      const modality = JSON.parse(JSON.stringify(event));
+
+      const raceId = event.race_id;
+      const role = httpContext.get("reqUserRole"); //'GUEST'
+
+      // Checking if inscriptions are available for the modality
+      const race = await models.Races.findByPk(raceId, {
+        attributes: ["max_inscriptions"],
+      });
+
+      const {
+        raceTotalInscriptions,
+      } = await getModalitiesAndTotalInscriptionsByRace(raceId);
+
+      const inscriptions = await models.Inscription.findAll({
+        where: { modality_id: modality.id },
+        raw: true,
+      });
+
+      const inscriptionsInModality = await models.ClientInscription.findAll({
+        where: {
+          inscription_id: inscriptions.map((inscription) => inscription.id),
+        },
+      });
+
+      const inscriptionsInTemp = await models.TempInscriptions.findAll({
+        where: { modality_id: modality.id },
+        raw: true,
+      });
+
+      const inscriptionsInModalityInTemp = await models.TempClientInscriptions.findAll(
+        {
+          where: {
+            inscription_id: inscriptionsInTemp.map(
+              (inscription) => inscription.id,
+            ),
+          },
+        },
+      );
+
+      const modalityConfiguration = await models.ModalitiesView.findByPk(
+        modality.id,
+      );
+
+      const {
+        maxInscriptions: modalityMaxInscriptions,
+        totalInscriptions: modalityTotalInscriptions,
+      } = modalityConfiguration.dataValues;
+
+      const { modalityInscriptionConfig, finish_date, attributes } = modality;
+      const {
+        startDate,
+        endDate,
+        inscriptionStartDateTime,
+        inscriptionEndDateTime,
+        allowInscriptions,
+        ageCheckDate,
+        gender,
+        minimumAge,
+        maximumAge,
+        minimumAgeType,
+        maximunAgeType: maximumAgeType,
+        priceDefault,
+        limitWebInscriptions,
+      } = modalityInscriptionConfig;
+
+      if (role !== "GUEST" || role !== "ATHLETE") {
+        const inscriptionStatus = getModalityInscriptionStatus(
+          {
+            inscriptionStartDate: startDate,
+            inscriptionEndDate: endDate,
+            inscriptionStartDateTime,
+            inscriptionEndDateTime,
+            allowInscriptions: allowInscriptions,
+            endDate: finish_date,
+            maxInscriptions: modalityMaxInscriptions,
+            totalInscriptions: modalityTotalInscriptions,
+          },
+          race.max_inscriptions,
+          raceTotalInscriptions,
+          "PANEL",
+        );
+        if (inscriptionStatus !== "ENABLED") {
+          throw new Error(
+            `The inscriptions to this modality are not enabled since it is ${inscriptionStatus}`,
+          );
+        }
+      } else {
+        const inscriptionStatus = getModalityInscriptionStatus(
+          {
+            inscriptionStartDate: startDate,
+            inscriptionEndDate: endDate,
+            inscriptionStartDateTime,
+            inscriptionEndDateTime,
+            allowInscriptions: allowInscriptions,
+            endDate: finish_date,
+            maxInscriptions: modalityMaxInscriptions,
+            totalInscriptions: modalityTotalInscriptions,
+          },
+          race.max_inscriptions,
+          raceTotalInscriptions,
+        );
+        if (inscriptionStatus !== "ENABLED") {
+          throw new Error(
+            `The inscriptions to this modality are not enabled since it is ${inscriptionStatus}`,
+          );
+        }
+      }
+
+      // End - Checking if inscriptions are available for the modality
+
+      // Getting extra data (are available discounts, age ranges for inscriptions,
+      // inscriptions commission) to send
+      const discounts = await models.Discounts.count({
+        where: { raceId },
+      });
+
+      const commission = await getInscriptionComission(raceId, appConfig);
+
+      const { ageChecker, birthMin, birthMax } = getAgeRangesForInscription(
+        minimumAge,
+        maximumAge,
+        minimumAgeType,
+        maximumAgeType,
+        ageCheckDate,
+      );
+
+      const parsedAttributes = await validateAttributesLimit(
+        attributes,
+        modality.id,
+      );
+
+      const pricesUsedCount = [
+        ...inscriptionsInModalityInTemp,
+        ...inscriptionsInModality,
+      ]
+        .filter((inscription) =>
+          modality.Prices.map((price) => price.id).includes(
+            inscription.price_id,
+          ),
+        )
+        .reduce(
+          (acc, inscription) => ({
+            ...acc,
+            [inscription.price_id]: acc[inscription.price_id]
+              ? acc[inscription.price_id] + 1
+              : 1,
+          }),
+          {},
+        );
+      let validPrices = modality.Prices.filter((price) =>
+        price.maxAthletes
+          ? pricesUsedCount[price.id]
+            ? price.maxAthletes > pricesUsedCount[price.id]
+            : true
+          : true,
+      );
+      validPrices = validPrices.map((price) => {
+        return {
+          actualUses: pricesUsedCount[price.id] || 0,
+          ...price,
+        };
+      });
+
+      const prices =
+        validPrices.length == 0
+          ? [
+              {
+                id: null,
+                name: "DEFAULT",
+                amount: +priceDefault,
+              },
+            ]
+          : validPrices;
+
+      const { location1, location2, location3 } = modalityInscriptionConfig;
+      const raceLeftInscriptions = race.max_inscriptions
+        ? race.max_inscriptions - raceTotalInscriptions
+        : null;
+      const modalityLeftInscriptions = modalityMaxInscriptions
+        ? modalityMaxInscriptions - modalityTotalInscriptions
+        : null;
+
+      let inscriptionsLeft = limitWebInscriptions || 10; // By default the max inscriptions per transaction
+
+      if (modalityLeftInscriptions) {
+        if (raceLeftInscriptions) {
+          inscriptionsLeft = Math.min(
+            raceLeftInscriptions,
+            modalityLeftInscriptions,
+          );
+        } else {
+          inscriptionsLeft = Math.min(
+            inscriptionsLeft,
+            modalityLeftInscriptions,
+          );
+        }
+      } else {
+        if (raceLeftInscriptions) {
+          inscriptionsLeft = Math.min(inscriptionsLeft, raceLeftInscriptions);
+        }
+      }
+
+      return {
+        config: {
+          lockTime,
+        },
+        id: modality.id,
+        discounts: !!discounts,
+        ...modality,
+        race_id: undefined,
+        Prices: undefined,
+        modalityInscriptionConfig: undefined,
+        additionalFields: {
+          ...modalityInscriptionConfig,
+          allowInscriptions: undefined,
+          startDate: undefined,
+          endDate: undefined,
+          maxInscriptions: undefined,
+          minimumAge: undefined,
+          maximumAge: undefined,
+          priceDefault: undefined,
+          minimumAgeType: undefined,
+          maximunAgeType: undefined,
+          ageCheckDate: undefined,
+          gender: undefined,
+          location1: location1 && !location2 && !location3,
+          location2: location2 && !location3,
+        },
+        attributes: parsedAttributes,
+        inscriptions: {
+          birthMin,
+          birthMax,
+          dateCheckAge: ageChecker,
+          gender,
+        },
+        prices,
+        commission,
+        inscriptionsLeft,
+        default_price: priceDefault,
+      };
+    })
+    .catch((e) => {
+      const error = {
+        code: 404,
+        message: LanguageService.getMessage("GET_MODALITY_FAILURE"),
+        description: e,
+      };
+      throw error;
+    });
+};
+
+const getInscriptionComission = async (raceId, appConfig) => {
+  const raceComission = await models.Races.findOne({
+    where: { id: raceId },
+    attributes: [
+      "company_id",
+      "inscription_commission",
+      "inscription_commission_type",
+    ],
+    raw: true,
+  });
+
+  if (raceComission.inscription_commission == null) {
+    const companyComission = await models.Company.findOne({
+      where: { id: raceComission.company_id },
+      attributes: ["comissionManagement", "comission_type"],
+      raw: true,
+    });
+
+    return companyComission.comissionManagement == null
+      ? {
+          value: appConfig.commission,
+          type: "PCT",
+        }
+      : {
+          value: companyComission.comissionManagement,
+          type: companyComission.comission_type,
+        };
+  } else {
+    return {
+      value: raceComission.inscription_commission,
+      type: raceComission.inscription_commission_type,
+    };
+  }
+};
+
+/**
+ * Return a string with the message of the inscriptions status.
+ * @param {object} modality Modality identification id
+ * @param {string} modality.inscriptionStartDate
+ * @param {string} modality.inscriptionEndDate
+ * @param {string} modality.inscriptionStartDateTime
+ * @param {string} modality.inscriptionEndDateTime
+ * @param {boolean} modality.allowInscriptions
+ * @param {string} modality.endDate
+ * @param {number} modality.maxInscriptions
+ * @param {number} modality.totalInscriptions
+ * @param {number} raceMaxInscriptions The race maximum limit of inscriptions
+ * @param {number} raceTotalInscriptions The race actual amount of inscriptions
+ */
+const getModalityInscriptionStatus = (
+  modality,
+  raceMaxInscriptions,
+  raceTotalInscriptions,
+  from = "WEB",
+) => {
+  const today = new Date();
+  let {
+    inscriptionStartDate,
+    inscriptionEndDate,
+    inscriptionStartDateTime,
+    inscriptionEndDateTime,
+    allowInscriptions,
+    endDate,
+    maxInscriptions,
+    totalInscriptions,
+  } = modality;
+  inscriptionStartDateTime = inscriptionStartDateTime || inscriptionStartDate;
+  inscriptionEndDateTime = inscriptionEndDateTime || inscriptionEndDate;
+
+  if (
+    !inscriptionStartDateTime ||
+    (inscriptionStartDateTime && new Date(inscriptionStartDateTime) > today)
+  ) {
+    return "NOT_STARTED_YET";
+  }
+
+  if (inscriptionEndDateTime && today > new Date(inscriptionEndDateTime)) {
+    return "CLOSED";
+  }
+
+  if (!allowInscriptions) {
+    return "CLOSED";
+  }
+
+  if (endDate && today > new Date(endDate)) {
+    return "MODALITY_FINISHED";
+  }
+
+  if (
+    maxInscriptions &&
+    maxInscriptions <= totalInscriptions &&
+    from === "WEB"
+  ) {
+    return "FULL_MODALITY";
+  }
+
+  if (
+    raceMaxInscriptions &&
+    raceMaxInscriptions <= raceTotalInscriptions &&
+    from === "WEB"
+  ) {
+    return "FULL_RACE";
+  }
+
+  return "ENABLED";
+};
+
+const getModalityInscriptionStatusForFront = async (modalityId) => {
+  const modality = await models.Modality.findByPk(modalityId);
+
+  const inscriptionConfig = await getInscriptionConfig(modalityId);
+
+  const inscriptionStartDate = inscriptionConfig.startDate;
+  const inscriptionEndDate = inscriptionConfig.endDate;
+  const inscriptionStartDateTime = inscriptionConfig.startDateTime;
+  const inscriptionEndDateTime = inscriptionConfig.endDateTime;
+  const allowInscriptions = inscriptionConfig.allowInscriptions;
+  const endDate = modality.endDate;
+  const maxInscriptions = inscriptionConfig.maxInscriptions;
+
+  const inscriptions = await models.Inscription.findAll({
+    where: { modality_id: modality.id },
+    raw: true,
+  });
+  const inscriptionsInModality = await models.ClientInscription.findAll({
+    where: {
+      inscription_id: inscriptions.map((inscription) => inscription.id),
+    },
+  });
+  const totalInscriptions = inscriptionsInModality.length;
+
+  const race = await models.Races.findByPk(modality.race_id);
+  const raceMaxInscriptions = race.max_inscriptions;
+
+  const {
+    raceTotalInscriptions,
+  } = await getModalitiesAndTotalInscriptionsByRace(race.id);
+
+  return await getModalityInscriptionStatus(
+    {
+      inscriptionStartDate,
+      inscriptionEndDate,
+      inscriptionStartDateTime,
+      inscriptionEndDateTime,
+      allowInscriptions,
+      endDate,
+      maxInscriptions,
+      totalInscriptions,
+    },
+    raceMaxInscriptions,
+    raceTotalInscriptions,
+    "PANEL",
+  );
+};
+
+/**
+ * Returns the modalities of the race and the total inscriptions of the race
+ * @param {*} raceId The race identification id
+ */
+const getModalitiesAndTotalInscriptionsByRace = async (raceId) => {
+  const modalities = await models.ModalitiesView.findAll({
+    where: {
+      raceId: raceId,
+      is_published: true,
+    },
+    order: [
+      ["startDate", "ASC"],
+      ["startTime", "ASC"],
+    ],
+    attributes: {
+      exclude: ["raceId", "isPublished", "gender", "race_id"],
+    },
+    raw: true,
+  });
+
+  //Add times to dates
+  
+  modalities.forEach((modality) => {
+    modality.totalinscriptionbsPayed = getModalitieesPayedInscriptions(raceId)
+    modality.startDate = utils.getDateAndTime(
+      modality.startDate,
+      modality.startTime,
+    );
+    modality.inscriptionStartDate = utils.getDateAndTime(
+      modality.inscriptionStartDate,
+      modality.inscriptionStartTime,
+    );
+    modality.inscriptionEndDate = utils.getDateAndTime(
+      modality.inscriptionEndDate,
+      modality.inscriptionEndTime,
+    );
+  });
+
+  const raceTotalInscriptions = modalities.reduce(
+    (acc, modality) => acc + modality.totalInscriptions,
+    0,
+  );
+  return {
+    modalities,
+    raceTotalInscriptions,
+  };
+};
+
+const getModalitieesPayedInscriptions = async(modalityID) =>{
+    return await models.Inscription.count(
+      {
+        raw: true,
+        where:{
+          modality_id: modalityID,
+          status:"PAID"
+        }
+      }
+    )
+}
+
+const getModalitiesInscriptions = async (modalityId) => {
+  return await models.ModalitiesView.findByPk(modalityId);
+};
+
+/**
+ * Send the dates that are the limits given the minimun and maximum age or year
+ * @param {number} minimumAge
+ * @param {number} maximumAge
+ * @param {string} minimumAgeType (AGE | YEAR) Default: AGE
+ * @param {string} maximumAgeType (AGE | YEAR) Default: AGE
+ * @param {string} ageCheckDate - Date to be checked with.
+ * If not provided but there is a min or max age it will be today by default
+ */
+const getAgeRangesForInscription = (
+  minimumAge,
+  maximumAge,
+  minimumAgeType = "AGE",
+  maximumAgeType = "AGE",
+  ageCheckDate,
+) => {
+  if (minimumAgeType === null) {
+    minimumAgeType = "AGE";
+  }
+  if (maximumAgeType === null) {
+    maximumAgeType = "AGE";
+  }
+
+  const ageChecker = ageCheckDate
+    ? new Date(ageCheckDate)
+    : minimumAge || maximumAge
+    ? new Date()
+    : null;
+
+  if (!ageChecker) {
+    return {
+      ageChecker,
+      birthMin: null,
+      birthMax: null,
+    };
+  }
+
+  const ageTypeMaxBirthday = new Date(
+    new Date(ageChecker).setFullYear(ageChecker.getFullYear() - minimumAge),
+  );
+  const ageTypeMinBirthday = new Date(
+    new Date(ageChecker).setFullYear(ageChecker.getFullYear() - maximumAge),
+  );
+
+  const yearTypeMinBirthday = new Date(
+    new Date(ageChecker).setFullYear(maximumAge),
+  );
+  const yearTypeMaxBirthday = new Date(
+    new Date(ageChecker).setFullYear(minimumAge),
+  );
+
+  const birthMin = maximumAge
+    ? maximumAgeType === "AGE"
+      ? ageTypeMinBirthday
+      : yearTypeMinBirthday
+    : null;
+
+  const birthMax = minimumAge
+    ? minimumAgeType === "AGE"
+      ? ageTypeMaxBirthday
+      : yearTypeMaxBirthday
+    : null;
+
+  return {
+    ageChecker,
+    birthMin,
+    birthMax,
+  };
+};
+
+const validateAttributesLimit = async (attributes, modalityId) => {
+  return attributes.map((a) => {
+    const obj = { ...a, ModalityAttributesOptions: a.ModalityAttrOptionsUseds };
+    delete obj.ModalityAttrOptionsUseds;
+
+    return obj;
+  });
+
+  //NOTE NOT Sure if this broke something, but see useless
+
+  // const attributesInModality = await models.ModalityAttribute.findAll({
+  //   where: { modalityId, type: { [Op.or]: ["SELECT", "PRODUCT"] } },
+  //   attributes: ["id"],
+  //   include: [
+  //     {
+  //       required: false,
+  //       model: models.ModalityAttributesOption,
+  //       attributes: ["id", "limit"],
+  //     },
+  //   ],
+  // });
+
+  // const attributesId = attributesInModality.map((attribute) => attribute.id);
+
+  // const attributesUsedInModality = await models.ClientInscriptionsAttribute.findAll(
+  //   {
+  //     where: {
+  //       modalityAttributeId: { [Op.in]: attributesId },
+  //     },
+  //   }
+  // );
+
+  // console.log(attributes);
+
+  // if (attributesUsedInModality.length === 0) {
+  //   return attributes.map((attribute) => ({
+  //     ...attribute,
+  //     ModalityAttributesOptions: attribute.ModalityAttributesOptions.map(
+  //       delete obj.
+  //       (option) => ({
+  //         ...option,
+  //         limit: undefined,
+  //         remaining: option.limit,
+  //       })
+  //     ),
+  //   }));
+  // } else {
+  //   let attributesGrouped = {};
+
+  //   attributesInModality.forEach((attributeInModality) => {
+  //     const optionsId = attributeInModality.ModalityAttributesOptions.map(
+  //       delete obj.
+  //       (attributeOptions) => attributeOptions.id
+  //     );
+
+  //     const a = attributesUsedInModality
+  //       .filter(
+  //         (attribute) =>
+  //           attribute.modalityAttributeId === attributeInModality.id &&
+  //           optionsId.includes(+attribute.value)
+  //       )
+  //       .reduce((results, attribute) => {
+  //         const key = `${attribute.modalityAttributeId}-${attribute.value}`;
+  //         return {
+  //           ...results,
+  //           [key]: {
+  //             attributeId: attribute.modalityAttributeId,
+  //             attributeOptionId: +attribute.value,
+  //             usages:
+  //               typeof results[key] === "undefined"
+  //                 ? 1
+  //                 : results[key].usages + 1,
+  //           },
+  //         };
+  //       }, {});
+
+  //     attributesGrouped = { ...attributesGrouped, ...a };
+  //   });
+
+  //   return attributes.map((attribute) => ({
+  //     ...attribute,
+  //     ModalityAttributesOptions: attribute.ModalityAttrOptionsUseds.map(
+  //       delete obj.
+  //       (option) => {
+  //         const isOption =
+  //           attributesGrouped[`${option.attributeId}-${option.id}`];
+  //         if (isOption) {
+  //           return {
+  //             ...option,
+  //             remaining: option.limit - isOption.usages,
+  //           };
+  //         } else {
+  //           return {
+  //             ...option,
+  //             remaining: option.limit,
+  //           };
+  //         }
+  //       }
+  //     ),
+  //   }));
+  // }
+};
+
+const _getClassificationData = async (
+  classificationFilter,
+  name,
+  classifications,
+  field,
+  modality,
+  pageSize,
+  pageNumber,
+  sort,
+) => {
+  const { types, is_mapped, data } = classifications.find(
+    (c) => c.name == name,
+  );
+
+  let parseField = Sequelize.literal(`row_data->>'${field}'`);
+  if (types && types[field]) {
+    parseField = Sequelize.cast(parseField, types[field].type);
+  }
+
+  const rowClassification = await models.ViewClassificationsRows.findAndCountAll(
+    {
+      where: {
+        modality_id: modality.id,
+        name,
+        ...classificationFilter,
+      },
+      limit: pageSize,
+      offset: (pageNumber - 1) * pageSize,
+      order: [[parseField, sort]],
+    },
+  );
+
+  let filters = {
+    categories: [],
+    genders: [],
+    clubs: [],
+  };
+
+  if (is_mapped && data) {
+    const filterReduced = data.reduce(
+      (acc, curr) => {
+        if (curr.category)
+          acc.categories = { ...acc.categories, [curr.category]: true };
+
+        if (curr.gender) acc.genders = { ...acc.genders, [curr.gender]: true };
+
+        if (curr.club) acc.clubs = { ...acc.clubs, [curr.club]: true };
+
+        return acc;
+      },
+      {
+        categories: {},
+        genders: {},
+        clubs: {},
+      },
+    );
+
+    filters = Object.entries(filterReduced).reduce((acc, [key, values]) => {
+      acc[key] = Object.keys(values);
+      return acc;
+    }, filters);
+  }
+
+  let columns = [];
+
+  const removedColumns = ["client_id", "id", "dni"];
+
+  if (rowClassification.rows[0]) {
+    columns = Object.keys(rowClassification.rows[0].row_data).filter(
+      (row) => !removedColumns.includes(row),
+    );
+  }
+
+  const rows = rowClassification.rows.map((row) => ({
+    ...row.row_data,
+  }));
+
+  return {
+    classification: {
+      count: rowClassification.count,
+      rows,
+    },
+    columns,
+    filters,
+    //extraColumns,
+    // pdfLink: pdfLink ? pdfLink.pdf_location : ""
+  };
+};
+
+const _hasClassifications = async (modalityId) => {
+  let classifications = await models.ClassificationV2.findAll({
+    where: {
+      modality_id: modalityId,
+    },
+  });
+  return classifications.length > 0;
+};
+
+const getClassification = async (params) => {
+  try {
+    const sort = params.sort || "ASC";
+    const field = params.field || "position";
+    const pageNumber = params.pageNumber || 1;
+    const pageSize = params.pageSize || 10;
+    const slug = params.params.slug.value;
+    const idLoggedUser = params.params.idLoggedUser.value;
+    const names = params.names ? params.names : [];
+
+    //end getClassificationData
+
+    const modality = await models.Modality.findOne({
+      raw: true,
+      where: { slug },
+    });
+
+    let classifications = await models.ClassificationV2.findAll({
+      // attributes: ["id", "name", "types", "is_mapped"],
+      where: {
+        modality_id: modality.id,
+      },
+    });
+
+    const classificationFilter = _getClassificationFilter(params);
+
+    const reduceClassifBy = names.length
+      ? names
+      : classifications.map((c) => c.name);
+
+    // get classification by type
+    const classificationData = await reduceClassifBy.reduce(
+      async (acc, curr) => {
+        const classif = await _getClassificationData(
+          classificationFilter,
+          curr,
+          classifications,
+          field,
+          modality,
+          pageSize,
+          pageNumber,
+          sort,
+        );
+
+        acc = { ...(await acc), [curr]: classif };
+
+        return acc;
+      },
+      {},
+    );
+
+    const race = await models.Races.findOne({
+      raw: true,
+      where: { id: modality.race_id },
+    });
+
+    const logged = await _getLoggedUserClassification(
+      idLoggedUser,
+      modality.id,
+    );
+
+    const podium = null;
+
+    classifications = JSON.parse(JSON.stringify(classifications)).map((c) => {
+      const obj = c;
+      delete obj.data;
+      delete obj.createdAt;
+      delete obj.updatedAt;
+      delete obj.types;
+
+      return obj;
+    });
+
+    // const pdfLink = classif.pdf_location;
+
+    return {
+      classifications,
+      classificationData,
+      podium,
+      logged,
+      race,
+      modality,
+      pdfLink: "",
+    };
+  } catch (e) {
+    const error = {
+      code: 500,
+      message: LanguageService.getMessage("READ_CLASSIFICATION_FAILURE"),
+      description: e,
+    };
+    throw error;
+  }
+};
+/*
+const getModalityVoucher = async params => {
+  const { modalityId, nif, birthDate } = params;
+  let voucherData = {};
+
+  const clientInscriptions = await getById(modalityId)
+    .then(async modality => {
+      const modalityVoucherData = {
+        modalityDate: modality.start_date
+      };
+      voucherData = { ...voucherData, ...modalityVoucherData };
+
+      await models.Races.findOne({ where: { id: modality.race_id } }).then(
+        race => {
+          const raceVoucherData = {
+            raceName: race.name,
+            raceImage: race.header_image_url
+          };
+
+          voucherData = { ...voucherData, ...raceVoucherData };
+        }
+      );
+    })
+    .then(async () => {
+      return await models.Inscription.findAll({
+        where: { modality_id: modalityId }
+      }).then(inscriptionArray => {
+        return inscriptionArray.map(async inscription => {
+          return await models.ClientInscription.findOne({
+            where: {
+              inscription_id: inscription.id,
+              dni: nif,
+              birthday: birthDate
+            }
+          });
+        });
+      });
+    });
+
+  return Promise.all(clientInscriptions)
+    .then(clientInscription => {
+      return clientInscription
+        .filter(item => {
+          return item !== null;
+        })
+        .pop();
+    })
+    .then(async inscriptionSelected => {
+      const clientVoucherData = {
+        clientName:
+          inscriptionSelected.name + " " + inscriptionSelected.surnames,
+        clientDni: inscriptionSelected.dni,
+        clientBirthday: inscriptionSelected.birthday,
+        clientClub: inscriptionSelected.club
+      };
+
+      voucherData = { ...voucherData, ...clientVoucherData };
+      return await models.Payment.findOne({
+        where: {
+          inscription_id: await inscriptionSelected.inscription_id
+        }
+      });
+    })
+    .then(async price => {
+      const priceVoucherData = {
+        paymentPrice: price.price,
+        paymentState: price.state,
+        locator: price.locator
+      };
+      voucherData = { ...voucherData, ...priceVoucherData };
+
+      const s3File = await s3.getBase64Image(voucherData.raceImage);
+      voucherData = { ...voucherData, raceImage: s3File };
+
+      return voucherData;
+      // return {
+
+      // };
+    });
+};
+*/
+const getModalityVoucher = async (params) => {
+  let inscription = {};
+  let voucherData = {};
+  let pdfInscription;
+  const { modalityId, nif, birthDate } = params;
+
+  try {
+    //get current logged user
+    const _bd = new Date(birthDate);
+    const _bdNext = new Date(_bd);
+    _bdNext.setDate(_bd.getDate() + 1);
+
+    const userId = httpContext.get("reqUserId"); //542
+    const role = httpContext.get("reqUserRole"); //'GUEST'
+    if (role === "ATHLETE") {
+      // get inscription from athleteId and modalityId
+
+      //get AthleteId from userId
+      const athleteId = await models.Client.findOne({
+        raw: true,
+        where: { user_id: userId },
+      })
+        .then((client) => client.id)
+        .catch((e) => console.log(e));
+
+      if (athleteId && !nif && !birthDate) {
+        inscription = await models.InscriptionsView.findAll({
+          raw: true,
+          where: { athleteId, modalityId },
+        });
+      } else if (athleteId && nif && birthDate) {
+        inscription = await models.InscriptionsView.findAll({
+          raw: true,
+          where: {
+            modalityId,
+            athleteDni: { [Op.iLike]: `%${nif}%` },
+            athleteBirthday: {
+              [Op.gte]: _bd,
+              [Op.lt]: _bdNext,
+            },
+          },
+        });
+      }
+      // get inscription data
+    } else {
+      //get inscription from modalityId, birthday and dni
+      inscription = await models.InscriptionsView.findAll({
+        raw: true,
+        where: {
+          modalityId,
+          athleteDni: { [Op.iLike]: `%${nif}%` },
+          athleteBirthday: {
+            [Op.gte]: _bd,
+            [Op.lt]: _bdNext,
+          },
+        },
+      });
+    }
+    const inscriptionPay = inscription.filter(
+      (insc) => insc.combinedStatus != "CANCELLED",
+    );
+    const inscriptionCancelled = inscription.filter(
+      (insc) => insc.combinedStatus == "CANCELLED",
+    );
+    inscription =
+      inscriptionPay.length > 0
+        ? inscriptionPay[0]
+        : inscriptionCancelled.length > 0
+        ? inscriptionCancelled[0]
+        : {};
+
+    if (inscription && inscription.combinedStatus == "CANCELLED") {
+      return { combinedStatus: "cancelled" };
+    }
+    // get data for voucher
+    const modality = await models.Modality.findByPk(inscription.modalityId);
+    const clientInscription = await models.ClientInscription.findByPk(
+      inscription.clientInscriptionId,
+      { raw: true },
+    );
+    // get payment from inscriptions and translate
+    const payment = await models.Inscription.findOne({
+      where: {
+        id: inscription.id,
+      },
+    }).then((res) => {
+      switch (res.dataValues.status) {
+        case "PAID":
+          return "PAGADO";
+        case "PENDING":
+          return "PENDIENTE";
+        case "REJECTED":
+          return "DENEGADO";
+        default:
+          return null;
+      }
+    });
+
+    let price;
+    if (clientInscription.price_id) {
+      price = await models.Price.findByPk(clientInscription.price_id, {
+        raw: true,
+      });
+    }
+
+    const pay = await models.Payment.findOne({
+      where: { inscription_id: inscription.id },
+      raw: true,
+    });
+    const tpv = pay ? pay.tpv : "";
+
+    let paymentInfo = {
+      paymentLocator: payment ? payment : "",
+    };
+
+    const clientInscriptionInfo = {
+      locator: clientInscription.locator,
+      createdAt: clientInscription.createdAt,
+      name: `${clientInscription.name}  ${clientInscription.surnames}`,
+      dni: clientInscription.dni,
+      birthday: clientInscription.birthday,
+      club: clientInscription.club,
+      price: clientInscription.price,
+      priceObject: price,
+      ...clientInscription,
+      tpv,
+      country: countryHelper.countries[clientInscription.country],
+    };
+
+    const modalityInfo = {
+      modalityName: inscription.modalityName,
+      startDate: modality.start_date,
+      startTime: modality.time_start,
+    };
+
+    const emailImageUrl = await models.Races.findByPk(inscription.raceId)
+      .then((race) => race.email_image_url)
+      .catch((e) => console.log(e));
+
+    // console.log({ emailImageUrl });
+
+    const emailImage = await s3Helper.getBase64Image(emailImageUrl);
+    voucherData = {
+      ...clientInscriptionInfo,
+      ...paymentInfo,
+      ...modalityInfo,
+      race: inscription.raceName,
+      modality: { id: inscription.modalityId, name: inscription.modalityName },
+    };
+
+    const qrCode = await QRCodeService.checkORSaveQRCode(voucherData.id);
+
+    pdfInscription = await pdfHelper.createInscriptionPdf(
+      voucherData,
+      emailImage,
+      qrCode,
+    );
+  } catch (error) {
+    console.log(error);
+    throw error;
+  }
+  return pdfInscription;
+};
+
+const getModalitClassificationsyPdf = async (params) => {
+  const sort = params.sort || "ASC";
+  const field = params.field || "position";
+  const pageNumber = params.pageNumber || 1;
+  const pageSize = params.pageSize || 10;
+  const slug = params.params.slug.value;
+
+  const columns = params.columns ? params.columns : [];
+
+  const modality = await models.Modality.findOne({
+    where: { slug },
+    include: [
+      {
+        model: models.Races,
+        as: "race",
+      },
+    ],
+  });
+
+  const classifications = await models.ClassificationV2.findAll({
+    attributes: ["id", "name", "types", "is_mapped"],
+    where: {
+      modality_id: modality.id,
+      name: params.name,
+    },
+  });
+
+  const classificationFilter = _getClassificationFilter(params);
+
+  const data = await _getClassificationData(
+    classificationFilter,
+    params.name,
+    classifications,
+    field,
+    modality,
+    null,
+    null,
+    sort,
+  );
+
+  const { race } = modality;
+
+  const raceImageBase64 = await s3Helper.getBase64Image(race.card_image_url);
+  // parse to PDF
+  const pdfFile = await pdfHelper.createClassificationPdf({
+    modality,
+    race,
+    classification: {
+      ...data,
+      columns: columns.length ? columns : data.columns,
+      isMapped: classifications[0].is_mapped,
+      lang: params.lang,
+    },
+    parseSecs: (v) => v,
+    raceImageBase64,
+  });
+
+  return pdfFile;
+};
+
+module.exports = {
+  getById,
+  getByRaceId,
+  create,
+  update,
+  updateOrCreateInscriptionConfig,
+  getInscriptionConfig,
+  getAgeRangesForInscription,
+  deleteById,
+  getModalityBySlug,
+  getModalityInscriptionStatus,
+  getModalitiesAndTotalInscriptionsByRace,
+  getModalitiesInscriptions,
+  getModalityInscriptionStatusForFront,
+  getClassification,
+  getModalityVoucher,
+  getInscriptionComission,
+  getModalitClassificationsyPdf,
+  getModalitieesPayedInscriptions,
+};
+
+const models = require('../../models');
+const sequelize = require("sequelize");
+const modalityService = require("../../api/services/modalities.service")
+//CHAI
+const assert = require( "chai" ).assert;
+const chai = require('chai');
+const expect = chai.expect;
+
+let should = chai.should();
+describe("----- *** INSCRIPTIONS BY MODALITY *** -----", function () {
+    it("Should return total inscriptions by modality with status Paid",async function () {   
+        const modalityID="2"
+        await modalityService.getModalitieesPayedInscriptions(modalityID)
+        .then((results) => {
+            assert.notEqual(...results, undefined)
+        }).catch((error)=>{
+          throw new Error(error.message)
+        })
+    });
+      
+});
+
+
+
+const getModalitieesPayedInscriptions = async(modalityID) =>{
+    return await models.Inscription.count(
+      {
+        raw: true,
+        where:{
+          modality_id: modalityID,
+          status:"PAID"
+        }
+      }
+    )
+}

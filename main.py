@@ -8,8 +8,9 @@ from datetime import date
 from selenium import webdriver
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
 from selenium.common.exceptions import TimeoutException
 from datetime import datetime
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
@@ -125,6 +126,7 @@ lenexcelshape = lenexcel.shape[0]
 print(lenexcelcount)
 print(lenexcellen)
 lenexcel=lenexcellen-3
+
 def calculateAge(dateToCalculate):
     birth = datetime.datetime.strptime(dateToCalculate, "%d/%m/%Y")
     today = date.today()
@@ -373,6 +375,7 @@ def WriteForm(driver,url):
             SelectClickSubmit_by_xpath(driver,arrayForForm[i],str(arrayForXpath[i]),str(source_text_excel[i]))
         j = j + 1
     
+
 def checkIfElementExist(driver,value):
     try:
         WebDriverWait(driver, 3).until(EC.presence_of_element_located((By.XPATH, value)))
